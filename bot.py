@@ -1,8 +1,7 @@
 import os
 import sys
 import time
-from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
@@ -26,7 +25,7 @@ EXCLUDE = (
     "youth", "reserve", "amateur", "clubs", "futsal", "beach",
 )
 
-diag = []  # hata ayıklama notları
+diag = []
 
 
 # ---------------- API-Football ----------------
@@ -79,6 +78,13 @@ def fmt_prediction(p):
         lines.append(
             f"Olasılık % (ev/beraberlik/dep): {pc.get('home')} / {pc.get('draw')} / {pc.get('away')}"
         )
+    if pr.get("under_over"):
+        lines.append(f"API gol çizgisi tahmini (+ üst, - alt): {pr['under_over']}")
+    pg = pr.get("goals") or {}
+    if pg.get("home") or pg.get("away"):
+        lines.append(
+            f"API beklenen gol sınırı (ev/dep): {pg.get('home')} / {pg.get('away')}"
+        )
     teams = p.get("teams", {}) or {}
     for label, key in (("Ev sahibi", "home"), ("Deplasman", "away")):
         t = teams.get(key, {}) or {}
@@ -93,6 +99,10 @@ def fmt_prediction(p):
         ga = ((l5.get("goals") or {}).get("against") or {}).get("average")
         if gf is not None and ga is not None:
             parts.append(f"son 5 maç gol ort. {gf} atılan / {ga} yenilen")
+        sgf = (((lg.get("goals") or {}).get("for") or {}).get("average") or {}).get("total")
+        sga = (((lg.get("goals") or {}).get("against") or {}).get("average") or {}).get("total")
+        if sgf and sga:
+            parts.append(f"sezon maç başı gol {sgf} atılan / {sga} yenilen")
         if parts:
             lines.append(f"{label}: " + ", ".join(parts))
     comp = p.get("comparison") or {}
@@ -241,10 +251,16 @@ Bir maç için sakatlık/form verisi yoksa bunu o maçın risk notunda belirt.
 Görevin:
 1. Bu maçlar arasından en yüksek olasılıklı en az 2-3 maçı seç. Gerçekten güvenilir olan daha fazlaysa hepsini ekle (en fazla 6).
    Güvenilir maç yoksa zorlama ve bunu dürüstçe söyle.
-2. Her maç için: ⚽ maç, lig, saat (TR) / 🎯 tahmin (MS1, MS0, MS2, Alt-Üst, KG Var-Yok veya Çifte şans) /
-   📊 güven yüzdesi (tahmini) / 📝 verilere dayanan 2-3 cümlelik kısa analiz / ⚠️ tek cümlelik risk notu.
-3. Başa kısa bir "📅 Günün Özeti", sona "Garanti yoktur, bahis risklidir" uyarısı ekle.
-4. Milli maçlarda kadro rotasyonu ve hazırlık maçı motivasyonu risklidir, bunu risk notlarına yansıt.
+2. Her maç için TÜM bahis türlerini değerlendir ve verinin EN GÜÇLÜ desteklediği türü seç:
+   MS1, MS0, MS2, Çifte şans (1-0, 0-2, 1-2), Alt/Üst (1.5, 2.5, 3.5), KG Var, KG Yok.
+   Varsayılan olarak MS verme. Önce gol ortalamalarına (atılan/yenilen), gol çizgisi tahminine ve h2h skorlarına bak.
+   İki takım da çok gol atıyor/yiyorsa KG Var ve Üst, biri çok zayıf hücumdaysa KG Yok ve Alt, taraflar dengeliyse Çifte şans düşün.
+   Bir maçta MS belirsiz ama gol verisi netse, gol bazlı tahmin ver. Bir maçta en fazla 2 tahmin ver (ana ve alternatif).
+   Seçimi gerekçelendir. Veri bir türü desteklemiyorsa o türü zorlama.
+3. Her maç için: ⚽ maç, lig, saat (TR) / 🎯 tahmin / 📊 güven yüzdesi (tahmini) /
+   📝 verilere dayanan 2-3 cümlelik kısa analiz (hangi sayı bu tahmini destekliyor yaz) / ⚠️ tek cümlelik risk notu.
+4. Başa kısa bir "📅 Günün Özeti", sona "Garanti yoktur, bahis risklidir. Oran verisi olmadığı için değer (value) analizi yapılmadı." ekle.
+5. Milli maçlarda kadro rotasyonu ve hazırlık maçı motivasyonu risklidir, bunu risk notlarına yansıt.
 
 Kurallar: Türkçe yaz, bol emoji kullan, Markdown işareti (*, _, #) KULLANMA, düz metin ve emoji yaz.
 
