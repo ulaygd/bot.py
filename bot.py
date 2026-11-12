@@ -43,28 +43,28 @@ def ask_gemini(prompt: str) -> str:
         "tools": [{"google_search": {}}],
         "generationConfig": {"temperature": 0.3},
     }
-    last_err = None
+    errors = []
     for model in MODELS:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        for attempt in range(2):
-            try:
-                r = requests.post(
-                    url, params={"key": GEMINI_API_KEY}, json=body, timeout=180
-                )
-                if r.status_code == 404:
-                    last_err = f"{model} bulunamadı"
-                    break
-                r.raise_for_status()
+        try:
+            r = requests.post(
+                url, params={"key": GEMINI_API_KEY}, json=body, timeout=180
+            )
+            if r.status_code == 200:
                 data = r.json()
                 parts = data["candidates"][0]["content"]["parts"]
                 text = "".join(p.get("text", "") for p in parts).strip()
                 if text:
                     return text
-                last_err = "Boş yanıt"
-            except Exception as e:
-                last_err = e
-            time.sleep(10)
-    raise RuntimeError(f"Gemini yanıt vermedi: {last_err}")
+                errors.append(f"{model}: boş yanıt")
+            else:
+                msg = f"{model}: {r.status_code} {r.text[:300]}"
+                print(msg)
+                errors.append(msg)
+        except Exception as e:
+            errors.append(f"{model}: {e}")
+        time.sleep(5)
+    raise RuntimeError("Gemini hatası: " + " | ".join(errors))
 
 
 def chunk(text: str, limit: int = 3800):
@@ -87,6 +87,8 @@ def send_telegram(text: str):
             json={"chat_id": TELEGRAM_CHAT_ID, "text": part.strip()},
             timeout=30,
         )
+        if r.status_code != 200:
+            print(f"Telegram hatası: {r.status_code} {r.text[:300]}")
         r.raise_for_status()
         time.sleep(1)
 
@@ -95,10 +97,14 @@ def main():
     today = datetime.now(TR).strftime("%d.%m.%Y")
     try:
         report = ask_gemini(build_prompt())
-        send_telegram(f"⚽🔥 GÜNLÜK FUTBOL BÜLTENİ — {today}\n\n{report}")
     except Exception as e:
-        send_telegram(f"❌ Futbol botu hata verdi: {e}")
+        print(e)
+        try:
+            send_telegram(f"❌ Futbol botu hata verdi: {str(e)[:1500]}")
+        except Exception:
+            pass
         sys.exit(1)
+    send_telegram(f"⚽🔥 GÜNLÜK FUTBOL BÜLTENİ — {today}\n\n{report}")
 
 
 if __name__ == "__main__":
