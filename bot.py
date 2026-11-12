@@ -1,11 +1,13 @@
+import os
 import datetime
 import requests
 from google import genai
 from google.genai import types
 
 # ================= AYARLAR =================
-GEMINI_API_KEY = "AQ.Ab8RN6LKLHPhrg8W_SMlL-00xXiRYRf2wSEj6pFeMEeXZhe9ng"
-TELEGRAM_BOT_TOKEN = "9043761331:AAFrN4iW6c8Ze8igDDm-p-jL3uR-tRUteE"
+# Secrets'tan çekmeyi dener, bulamazsa doğrudan buradaki yedeği kullanır
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = "9043761331"
 # ===========================================
 
@@ -17,14 +19,14 @@ def gunluk_analiz_olustur():
     Bugünün tarihi: {bugun}.
     Görevin:
     1. Google Search aracını kullanarak bugünün gerçek futbol bültenini, maçlarını ve oran eğilimlerini güvenilir spor/istatistik kaynaklarından tara.
-    2. Bugün oynanacak maçlar arasından riski en az olan, istatistiksel olarak tutma olasılığı en yüksek OLAN TÜM MAÇLARI seç (sayı kısıtı yok, ne kadar sağlam maç varsa hepsini dahil et).
-    3. Seçtiğin her maç için net bir tahmin (Örn: MS 1, 2.5 Üst, KG Var, Çifte Şans vb.) ve mantıklı bir oran aralığı belirle.
-    4. Her maçın altına bu tahmini neden seçtiğini (takımların son durumları, iç/dış saha performansları, eksikler vb.) net ve kısa cümlelerle açıkla.
+    2. Bugün oynanacak maçlar arasından riski en az olan, istatistiksel olarak tutma olasılığı en yüksek OLAN TÜM MAÇLARI seç (sayı kısıtı yok).
+    3. Seçtiğin her maç için net bir tahmin (Örn: MS 1, 2.5 Üst, KG Var vb.) ve mantıklı bir oran belirle.
+    4. Her maçın altına bu tahmini neden seçtiğini kısaca açıkla.
 
-    Çıktı formatı Telegram'da okunması son derece kolay, temiz, emojili ve profesyonel bir bülten formatında olsun. Asla hayali maç üretme.
+    Çıktı formatı Telegram'da okunması kolay, temiz, emojili bir bülten olsun. Asla hayali maç üretme.
     """
 
-    print("🔍 Güvenilir kaynaklar taranıyor, risk analizi yapılıyor...")
+    print("🔍 Google Search ile bülten taranıyor...")
 
     response = client.models.generate_content(
         model="gemini-2.5-flash",
@@ -45,7 +47,13 @@ def telegrama_gonder(mesaj):
         "parse_mode": "Markdown"
     }
     
+    print(f"DEBUG: Hedef Chat ID -> {TELEGRAM_CHAT_ID}")
+    print(f"DEBUG: Token Kontrolü -> {'Mevcut' if TELEGRAM_BOT_TOKEN else 'BOŞ!'}")
+    
     cevap = requests.post(url, json=payload)
+    print(f"DEBUG: Telegram Durum Kodu -> {cevap.status_code}")
+    print(f"DEBUG: Telegram Yanıtı -> {cevap.text}")
+    
     if cevap.status_code == 200:
         print("✅ Günün analiz bülteni başarıyla Telegram'a gönderildi!")
     else:
@@ -60,4 +68,4 @@ if __name__ == "__main__":
         telegrama_gonder(bulten)
     except Exception as e:
         print(f"Bir hata oluştu: {e}")
-      
+        
