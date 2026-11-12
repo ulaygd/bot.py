@@ -18,8 +18,9 @@ TR = ZoneInfo("Europe/Istanbul")
 FD_BASE = "https://api.football-data.org/v4"
 AF_BASE = "https://v3.football.api-sports.io"
 
-MAX_PRED = 25      # olasılık verisi çekilecek maç sayısı
-MAX_MATCHES = 12   # Gemini'ye gidecek en güvenilir maç sayısı
+MAX_PRED = 40      # olasılık verisi çekilecek maç sayısı
+MAX_MATCHES = 20   # Gemini'ye gidecek en güvenilir maç sayısı
+FD_MAX = 10        # yedek kaynakta en fazla maç
 
 # Süper Lig, Premier Lig, La Liga, Serie A, Bundesliga, Ligue 1,
 # Şampiyonlar Ligi, Avrupa Ligi, Konferans Ligi,
@@ -37,6 +38,15 @@ EXCLUDE = (
 )
 
 diag = []
+
+
+def get_window():
+    """Şimdi ile bir sonraki 06:00 arası."""
+    now = datetime.now(TR)
+    end = now.replace(hour=6, minute=0, second=0, microsecond=0)
+    if now >= end:
+        end += timedelta(days=1)
+    return now, end
 
 
 def af_get(path, params=None, note=False):
@@ -168,25 +178,34 @@ def fmt_injuries(inj):
 def build_af_data():
     if not AF_KEY:
         return None, 0
-    today = datetime.now(TR).date().isoformat()
-    data = af_get("/fixtures", {"date": today, "timezone": "Europe/Istanbul"}, note=True)
-    if not data:
+    now, end = get_window()
+    dates = sorted({now.date().isoformat(), end.date().isoformat()})
+
+    resp = []
+    for d in dates:
+        data = af_get("/fixtures", {"date": d, "timezone": "Europe/Istanbul"}, note=True)
+        if data:
+            resp.extend(data.get("response", []))
+    if not resp:
         return None, 0
-    resp = data.get("response", [])
 
     wanted = []
     skipped = Counter()
+    in_window = 0
     for fx in resp:
         if fx["fixture"]["status"]["short"] != "NS":
             continue
         kick = datetime.fromisoformat(fx["fixture"]["date"]).astimezone(TR)
+        if not (now <= kick < end):
+            continue
+        in_window += 1
         if is_wanted(fx):
             wanted.append((kick, fx))
         else:
             lg = fx["league"]
             skipped[f"{lg['name']} ({lg.get('country')})"] += 1
 
-    # Önce milli maçlar ve büyük ligler, kendi içinde saat sırası
+    # Önce milli maçlar, sonra büyük ligler; kendi içinde saat sırası
     wanted.sort(key=lambda x: (0 if is_intl(x[1]) else 1, x[0]))
     candidates = wanted[:MAX_PRED]
 
@@ -201,7 +220,8 @@ def build_af_data():
             nodata.append(f"{fx['teams']['home']['name']}-{fx['teams']['away']['name']}")
 
     diag.append(
-        f"API-Football: bugün {len(resp)} maç, uygun {len(wanted)}, "
+        f"Pencere: {now.strftime('%d.%m %H:%M')} - {end.strftime('%d.%m %H:%M')} | "
+        f"API-Football: pencerede {in_window} maç, uygun {len(wanted)}, "
         f"incelenen {len(candidates)}, verisi olan {len(scored)}, verisi olmayan {len(nodata)}"
     )
     if nodata:
@@ -214,13 +234,14 @@ def build_af_data():
 
     scored.sort(key=lambda x: x[0], reverse=True)
     selected = scored[:MAX_MATCHES]
+    selected.sort(key=lambda x: x[1])  # bültende saat sırasıyla
 
     lines = []
     for conf, kick, fx, p in selected:
         lg = fx["league"]
         lines.append(f"MAÇ: {fx['teams']['home']['name']} - {fx['teams']['away']['name']}")
         lines.append(
-            f"Lig: {lg['name']} ({lg.get('country')}) | Saat (TR): {kick.strftime('%H:%M')}"
+            f"Lig: {lg['name']} ({lg.get('country')}) | Tarih/Saat (TR): {kick.strftime('%d.%m %H:%M')}"
         )
         lines.extend(fmt_prediction(p))
         inj = af_get("/injuries", {"fixture": fx["fixture"]["id"]})
@@ -252,10 +273,13 @@ def fd_get(path, params=None):
 def build_fd_data():
     if not FD_KEY:
         return None, 0
-    today = datetime.now(TR).date()
-    tomorrow = today + timedelta(days=1)
+    now, end = get_window()
     data = fd_get(
-        "/matches", {"dateFrom": today.isoformat(), "dateTo": tomorrow.isoformat()}
+        "/matches",
+        {
+            "dateFrom": now.date().isoformat(),
+            "dateTo": (end.date() + timedelta(days=1)).isoformat(),
+        },
     )
     if not data:
         return None, 0
@@ -264,11 +288,11 @@ def build_fd_data():
         if m.get("status") not in ("TIMED", "SCHEDULED"):
             continue
         kick = datetime.fromisoformat(m["utcDate"].replace("Z", "+00:00")).astimezone(TR)
-        if kick.date() == today:
+        if now <= kick < end:
             matches.append((kick, m))
     matches.sort(key=lambda x: x[0])
-    matches = matches[:MAX_MATCHES]
-    diag.append(f"football-data: bugün {len(matches)} maç")
+    matches = matches[:FD_MAX]
+    diag.append(f"football-data (yedek): pencerede {len(matches)} maç")
     if not matches:
         return None, 0
 
@@ -288,7 +312,9 @@ def build_fd_data():
     for kick, m in matches:
         code = m["competition"]["code"]
         lines.append(f"MAÇ: {m['homeTeam']['name']} - {m['awayTeam']['name']}")
-        lines.append(f"Lig: {m['competition']['name']} | Saat (TR): {kick.strftime('%H:%M')}")
+        lines.append(
+            f"Lig: {m['competition']['name']} | Tarih/Saat (TR): {kick.strftime('%d.%m %H:%M')}"
+        )
         for label, t in (("Ev sahibi", m["homeTeam"]), ("Deplasman", m["awayTeam"])):
             row = standings[code].get(t["id"])
             if row:
@@ -302,49 +328,43 @@ def build_fd_data():
 
 
 def build_prompt(data_text: str) -> str:
-    today = datetime.now(TR).strftime("%d.%m.%Y")
-    return f"""Bugünün tarihi: {today}. Aşağıda futbol API'lerinden alınmış GERÇEK maç verileri var.
-Maçlar büyük liglerden ve milli takım karşılaşmalarından oluşuyor. API olasılığı en yüksek olanlar önceden seçildi.
+    now, end = get_window()
+    return f"""Bugünün tarihi: {now.strftime('%d.%m.%Y')}. Kapsanan zaman aralığı (Türkiye saati):
+{now.strftime('%d.%m %H:%M')} - {end.strftime('%d.%m %H:%M')}.
+Aşağıda futbol API'lerinden alınmış GERÇEK maç verileri var (büyük ligler ve milli takım maçları).
 
 SADECE bu verilere dayanarak analiz yap. Veride olmayan bilgiyi uydurma.
 Bir maç için sakatlık/form verisi yoksa bunu o maçın risk notunda belirt.
 
 Görevin:
-1. Bu maçlar arasından güvenilir gördüğün HER maçı yaz. En az 2-3 maç olmalı, ama güvenilir maç
-   daha fazlaysa hepsini ekle, sayı sınırı yok. Veriler sağlamsa gönderilen maçların çoğunu yazabilirsin.
+1. Güvenilir gördüğün HER maçı yaz. En az 2-3 maç olmalı, güvenilir maç daha fazlaysa hepsini ekle, sayı sınırı yok.
    Gerçekten güvenilir maç yoksa zorlama ve bunu dürüstçe söyle. Elenen maçlar için tek satırda neden elendiğini yaz.
+   Maçları saat sırasıyla yaz.
 
-2. Seçtiğin HER maç için aşağıdaki şablonu doldur. Düşündüğün her şeyi ihtimalleriyle yaz:
+2. Seçtiğin HER maç için şu şablonu doldur (kısa ve net tut, çok maç olabilir):
 
-⚽ Maç adı | Lig (ülke) | Saat (TR)
+⚽ Maç adı | Lig (ülke) | Tarih Saat (TR)
+🔢 Skor beklentisi: en olası X-Y (%..), alternatifler X-Y (%..), X-Y (%..) | beklenen toplam gol ~..
+📊 MS1 %.. MS0 %.. MS2 %.. | Çifte şans 1-0 %.. 0-2 %.. 1-2 %..
+📊 Alt/Üst 1.5: Alt %.. Üst %.. | 2.5: Alt %.. Üst %.. | 3.5: Alt %.. Üst %.. | KG Var %.. KG Yok %..
+🧠 Neden: hangi veri neyi destekliyor (gol ortalamaları, form, h2h, eksikler, API olasılıkları) 2-3 madde.
+🎯 EN MANTIKLI BAHİS: ... (güven %..) | neden bu: MS, KG, Alt/Üst ve Çifte şansı kıyasla.
+   Örnek: "MS1 %48 ama KG Var %68, bu yüzden KG Var daha mantıklı." En fazla bir alternatif bahis ekle.
+⚠️ Risk: tek cümle.
 
-🔢 SKOR BEKLENTİSİ
-- En olası skor: X-Y (yaklaşık %..)
-- Alternatif skorlar: X-Y (%..), X-Y (%..)
-- Beklenen toplam gol: yaklaşık ..
+3. Başa kısa bir "📅 Günün Özeti" ekle.
 
-📊 İHTİMALLER (verilere göre tahmini, toplamları tutarlı olsun)
-- Maç sonucu: MS1 %.. | MS0 %.. | MS2 %..
-- Çifte şans: 1-0 %.. | 0-2 %.. | 1-2 %..
-- Alt/Üst 1.5: Alt %.. | Üst %..
-- Alt/Üst 2.5: Alt %.. | Üst %..
-- Alt/Üst 3.5: Alt %.. | Üst %..
-- Karşılıklı gol: KG Var %.. | KG Yok %..
+4. En sona "🎟️ KUPONLAR" bölümü ekle. Yukarıda yazdığın maçlardan, her maçtan EN FAZLA BİR seçim alarak:
+   - 🟢 Sağlam Kupon: en yüksek güvenli 2-3 seçim.
+   - 🟡 Dengeli Kupon: en güvenli 4-5 seçim (sağlam kupondakileri içerebilir).
+   Her kupon için: maç, seçim, güven %, ve tahmini birleşik ihtimal (seçimlerin yüzdelerinin çarpımı, hesaplayıp yaz).
+   Oran verisi olmadığı için toplam oranı hesaplama; kullanıcı oranları kendisi bahis sitesinden çarpabilir, bunu yaz.
+   Seçim sayısı arttıkça birleşik ihtimalin hızla düştüğünü bir cümleyle belirt.
+   Aynı seçimleri iki kupona koymak serbest ama kuponları farklı tutmaya çalış. Uygun seçim azsa kuponu küçük tut veya "uygun seçim yok" yaz.
 
-🧠 NEDEN BU İHTİMALLER
-- Hangi veri neyi destekliyor (gol ortalamaları, form, h2h, eksikler, API olasılıkları) 3-4 madde.
-
-🎯 EN MANTIKLI BAHİS: ... (güven %..)
-- Neden bu? MS, KG, Alt/Üst ve Çifte şans seçeneklerini birbiriyle kıyasla.
-  Örnek: "MS1 %48 ama KG Var %68, bu yüzden KG Var daha mantıklı."
-- En fazla bir alternatif bahis daha öner.
-
-⚠️ RİSK: Tek cümle (sakatlık/form verisi eksikse veya milli maçta rotasyon riski varsa belirt).
-
-3. Başa kısa bir "📅 Günün Özeti", sona "🏆 Günün En Güvenilir Seçimi" başlığı ekle ve oraya en güvenli 1-3 bahsi yaz.
-4. En sona şu uyarıyı yaz: "Yüzdeler verilere dayalı tahmindir, istatistiksel garanti değildir. Oran verisi olmadığı için değer (value) analizi yapılmadı. Bahis risklidir."
-5. Milli maçlarda kadro rotasyonu ve hazırlık maçı motivasyonu risklidir, güven yüzdesini buna göre düşük tut.
-6. Veri azsa yüzdeleri uç değerlere çekme, belirsizliği yansıt.
+5. En sona şu uyarıyı yaz: "Yüzdeler verilere dayalı tahmindir, istatistiksel garanti değildir. Oran verisi olmadığı için değer (value) analizi yapılmadı. Bahis risklidir."
+6. Milli maçlarda kadro rotasyonu ve hazırlık maçı motivasyonu risklidir, güven yüzdesini buna göre düşük tut.
+7. Veri azsa yüzdeleri uç değerlere çekme, belirsizliği yansıt. Yüzdeler tutarlı olsun (MS toplamı ~%100).
 
 Kurallar: Türkçe yaz, bol emoji kullan, Markdown işareti (*, _, #) KULLANMA, düz metin ve emoji yaz.
 
@@ -355,14 +375,14 @@ VERİLER:
 def ask_gemini(prompt: str) -> str:
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.3},
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 32000},
     }
     errors = []
     for model in MODELS:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         try:
             r = requests.post(
-                url, params={"key": GEMINI_API_KEY}, json=body, timeout=180
+                url, params={"key": GEMINI_API_KEY}, json=body, timeout=300
             )
             if r.status_code == 200:
                 parts = r.json()["candidates"][0]["content"]["parts"]
@@ -407,7 +427,11 @@ def send_telegram(text: str):
 
 
 def main():
-    today = datetime.now(TR).strftime("%d.%m.%Y")
+    now, end = get_window()
+    title = (
+        f"⚽🔥 GÜNLÜK FUTBOL BÜLTENİ — {now.strftime('%d.%m.%Y')}\n"
+        f"🕕 {now.strftime('%d.%m %H:%M')} → {end.strftime('%d.%m %H:%M')} arası maçlar"
+    )
     try:
         data_text, count = build_af_data()
         if not data_text:
@@ -415,8 +439,7 @@ def main():
         if not data_text:
             note = "\n".join(diag) if diag else "Kaynaklardan veri alınamadı."
             send_telegram(
-                f"⚽ GÜNLÜK FUTBOL BÜLTENİ — {today}\n\n"
-                f"Bugün analiz edilecek maç bulunamadı. 😴\n\n🔧 Kaynak durumu:\n{note}"
+                f"{title}\n\nBu aralıkta analiz edilecek maç bulunamadı. 😴\n\n🔧 Kaynak durumu:\n{note}"
             )
             return
         report = ask_gemini(build_prompt(data_text))
@@ -428,7 +451,7 @@ def main():
             pass
         sys.exit(1)
     footer = "\n".join(diag)
-    send_telegram(f"⚽🔥 GÜNLÜK FUTBOL BÜLTENİ — {today}\n\n{report}\n\n🔧 {footer}")
+    send_telegram(f"{title}\n\n{report}\n\n🔧 {footer}")
 
 
 if __name__ == "__main__":
