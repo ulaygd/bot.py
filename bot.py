@@ -18,7 +18,6 @@ FD_BASE = "https://api.football-data.org/v4"
 AF_BASE = "https://v3.football.api-sports.io"
 MAX_MATCHES = 10
 
-# Süper Lig, Premier Lig, La Liga, Serie A, Bundesliga, Ligue 1, ŞL, AL, KL
 TOP_IDS = {203, 39, 140, 135, 78, 61, 2, 3, 848}
 EXCLUDE = (
     "women", "femin", "u16", "u17", "u18", "u19", "u20", "u21", "u23",
@@ -28,7 +27,6 @@ EXCLUDE = (
 diag = []
 
 
-# ---------------- API-Football ----------------
 def af_get(path, params=None, note=False):
     time.sleep(6)
     try:
@@ -168,7 +166,6 @@ def build_af_data():
     return "\n".join(lines), len(items)
 
 
-# ---------------- football-data.org (yedek) ----------------
 def fd_get(path, params=None):
     time.sleep(7)
     for _ in range(2):
@@ -240,7 +237,6 @@ def build_fd_data():
     return "\n".join(lines), len(matches)
 
 
-# ---------------- Gemini ----------------
 def build_prompt(data_text: str) -> str:
     today = datetime.now(TR).strftime("%d.%m.%Y")
     return f"""Bugünün tarihi: {today}. Aşağıda futbol API'lerinden alınmış GERÇEK maç verileri var.
@@ -249,18 +245,40 @@ SADECE bu verilere dayanarak analiz yap. Veride olmayan bilgiyi uydurma.
 Bir maç için sakatlık/form verisi yoksa bunu o maçın risk notunda belirt.
 
 Görevin:
-1. Bu maçlar arasından en yüksek olasılıklı en az 2-3 maçı seç. Gerçekten güvenilir olan daha fazlaysa hepsini ekle (en fazla 6).
+1. Bu maçlar arasından en güvenilir en az 2-3 maçı seç. Gerçekten güvenilir olan daha fazlaysa hepsini ekle (en fazla 6).
    Güvenilir maç yoksa zorlama ve bunu dürüstçe söyle.
-2. Her maç için TÜM bahis türlerini değerlendir ve verinin EN GÜÇLÜ desteklediği türü seç:
-   MS1, MS0, MS2, Çifte şans (1-0, 0-2, 1-2), Alt/Üst (1.5, 2.5, 3.5), KG Var, KG Yok.
-   Varsayılan olarak MS verme. Önce gol ortalamalarına (atılan/yenilen), gol çizgisi tahminine ve h2h skorlarına bak.
-   İki takım da çok gol atıyor/yiyorsa KG Var ve Üst, biri çok zayıf hücumdaysa KG Yok ve Alt, taraflar dengeliyse Çifte şans düşün.
-   Bir maçta MS belirsiz ama gol verisi netse, gol bazlı tahmin ver. Bir maçta en fazla 2 tahmin ver (ana ve alternatif).
-   Seçimi gerekçelendir. Veri bir türü desteklemiyorsa o türü zorlama.
-3. Her maç için: ⚽ maç, lig, saat (TR) / 🎯 tahmin / 📊 güven yüzdesi (tahmini) /
-   📝 verilere dayanan 2-3 cümlelik kısa analiz (hangi sayı bu tahmini destekliyor yaz) / ⚠️ tek cümlelik risk notu.
-4. Başa kısa bir "📅 Günün Özeti", sona "Garanti yoktur, bahis risklidir. Oran verisi olmadığı için değer (value) analizi yapılmadı." ekle.
-5. Milli maçlarda kadro rotasyonu ve hazırlık maçı motivasyonu risklidir, bunu risk notlarına yansıt.
+
+2. Seçtiğin HER maç için aşağıdaki şablonu doldur. Düşündüğün her şeyi ihtimalleriyle yaz:
+
+⚽ Maç adı | Lig | Saat (TR)
+
+🔢 SKOR BEKLENTİSİ
+- En olası skor: X-Y (yaklaşık %..)
+- Alternatif skorlar: X-Y (%..), X-Y (%..)
+- Beklenen toplam gol: yaklaşık ..
+
+📊 İHTİMALLER (verilere göre tahmini, toplamları tutarlı olsun)
+- Maç sonucu: MS1 %.. | MS0 %.. | MS2 %..
+- Çifte şans: 1-0 %.. | 0-2 %.. | 1-2 %..
+- Alt/Üst 1.5: Alt %.. | Üst %..
+- Alt/Üst 2.5: Alt %.. | Üst %..
+- Alt/Üst 3.5: Alt %.. | Üst %..
+- Karşılıklı gol: KG Var %.. | KG Yok %..
+
+🧠 NEDEN BU İHTİMALLER
+- Hangi veri neyi destekliyor (gol ortalamaları, form, h2h, eksikler, API olasılıkları) 3-4 madde.
+
+🎯 EN MANTIKLI BAHİS: ... (güven %..)
+- Neden bu? MS, KG, Alt/Üst ve Çifte şans seçeneklerini birbiriyle kıyasla.
+  Örnek: "MS1 %48 ama KG Var %68, bu yüzden KG Var daha mantıklı."
+- En fazla bir alternatif bahis daha öner.
+
+⚠️ RİSK: Tek cümle (sakatlık/form verisi eksikse veya milli maçta rotasyon riski varsa belirt).
+
+3. Başa kısa bir "📅 Günün Özeti", sona "🏆 Günün En Güvenilir Seçimi" başlığı ekle ve oraya en güvenli 1-2 bahsi yaz.
+4. En sona şu uyarıyı yaz: "Yüzdeler verilere dayalı tahmindir, istatistiksel garanti değildir. Oran verisi olmadığı için değer (value) analizi yapılmadı. Bahis risklidir."
+5. Milli maçlarda kadro rotasyonu ve hazırlık maçı motivasyonu risklidir, güven yüzdesini buna göre düşük tut.
+6. Veri azsa yüzdeleri uç değerlere çekme, belirsizliği yansıt.
 
 Kurallar: Türkçe yaz, bol emoji kullan, Markdown işareti (*, _, #) KULLANMA, düz metin ve emoji yaz.
 
@@ -296,7 +314,6 @@ def ask_gemini(prompt: str) -> str:
     raise RuntimeError("Gemini hatası: " + " | ".join(errors))
 
 
-# ---------------- Telegram ----------------
 def chunk(text: str, limit: int = 3800):
     parts, cur = [], ""
     for para in text.split("\n\n"):
