@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+from collections import Counter
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -16,9 +17,20 @@ MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.1-flash-lite"]
 TR = ZoneInfo("Europe/Istanbul")
 FD_BASE = "https://api.football-data.org/v4"
 AF_BASE = "https://v3.football.api-sports.io"
-MAX_MATCHES = 10
 
-TOP_IDS = {203, 39, 140, 135, 78, 61, 2, 3, 848}
+MAX_PRED = 25      # olasılık verisi çekilecek maç sayısı
+MAX_MATCHES = 12   # Gemini'ye gidecek en güvenilir maç sayısı
+
+# Süper Lig, Premier Lig, La Liga, Serie A, Bundesliga, Ligue 1,
+# Şampiyonlar Ligi, Avrupa Ligi, Konferans Ligi,
+# Hollanda, Portekiz, Belçika, Brezilya, Arjantin, MLS
+TOP_IDS = {203, 39, 140, 135, 78, 61, 2, 3, 848, 88, 94, 144, 71, 128, 253}
+
+INTL_WORDS = (
+    "friendl", "qualif", "nations league", "world cup", "euro",
+    "copa america", "africa cup", "asian cup", "gold cup",
+)
+
 EXCLUDE = (
     "women", "femin", "u16", "u17", "u18", "u19", "u20", "u21", "u23",
     "youth", "reserve", "amateur", "clubs", "futsal", "beach",
@@ -55,15 +67,39 @@ def af_get(path, params=None, note=False):
     return data
 
 
-def is_wanted(fx):
+def is_excluded(fx):
     lg = fx["league"]
     home, away = fx["teams"]["home"]["name"], fx["teams"]["away"]["name"]
     text = f"{lg['name']} {home} {away}".lower()
     if any(w in text for w in EXCLUDE):
-        return False
+        return True
     if home.lower().endswith(" w") or away.lower().endswith(" w"):
+        return True
+    return False
+
+
+def is_intl(fx):
+    lg = fx["league"]
+    name = lg["name"].lower()
+    return lg.get("country") == "World" or any(w in name for w in INTL_WORDS)
+
+
+def is_wanted(fx):
+    if is_excluded(fx):
         return False
-    return lg["id"] in TOP_IDS or lg.get("country") == "World"
+    return fx["league"]["id"] in TOP_IDS or is_intl(fx)
+
+
+def pct(v):
+    try:
+        return int(str(v).replace("%", "").strip())
+    except Exception:
+        return 0
+
+
+def confidence(p):
+    pc = (p.get("predictions", {}) or {}).get("percent") or {}
+    return max(pct(pc.get("home")), pct(pc.get("draw")), pct(pc.get("away")))
 
 
 def fmt_prediction(p):
@@ -137,33 +173,61 @@ def build_af_data():
     if not data:
         return None, 0
     resp = data.get("response", [])
-    items = []
+
+    wanted = []
+    skipped = Counter()
     for fx in resp:
         if fx["fixture"]["status"]["short"] != "NS":
             continue
-        if not is_wanted(fx):
-            continue
         kick = datetime.fromisoformat(fx["fixture"]["date"]).astimezone(TR)
-        items.append((kick, fx))
-    diag.append(f"API-Football: bugün {len(resp)} maç, filtre sonrası {len(items)}")
-    items.sort(key=lambda x: x[0])
-    items = items[:MAX_MATCHES]
-    if not items:
+        if is_wanted(fx):
+            wanted.append((kick, fx))
+        else:
+            lg = fx["league"]
+            skipped[f"{lg['name']} ({lg.get('country')})"] += 1
+
+    # Önce milli maçlar ve büyük ligler, kendi içinde saat sırası
+    wanted.sort(key=lambda x: (0 if is_intl(x[1]) else 1, x[0]))
+    candidates = wanted[:MAX_PRED]
+
+    scored = []
+    nodata = []
+    for kick, fx in candidates:
+        pred = af_get("/predictions", {"fixture": fx["fixture"]["id"]})
+        if pred and pred.get("response"):
+            p = pred["response"][0]
+            scored.append((confidence(p), kick, fx, p))
+        else:
+            nodata.append(f"{fx['teams']['home']['name']}-{fx['teams']['away']['name']}")
+
+    diag.append(
+        f"API-Football: bugün {len(resp)} maç, uygun {len(wanted)}, "
+        f"incelenen {len(candidates)}, verisi olan {len(scored)}, verisi olmayan {len(nodata)}"
+    )
+    if nodata:
+        diag.append("Veri alınamayan maçlar: " + ", ".join(nodata[:6]))
+    if skipped:
+        top = ", ".join(f"{k} x{v}" for k, v in skipped.most_common(8))
+        diag.append("Elenen ligler: " + top)
+    if not scored:
         return None, 0
 
+    scored.sort(key=lambda x: x[0], reverse=True)
+    selected = scored[:MAX_MATCHES]
+
     lines = []
-    for kick, fx in items:
-        fid = fx["fixture"]["id"]
+    for conf, kick, fx, p in selected:
+        lg = fx["league"]
         lines.append(f"MAÇ: {fx['teams']['home']['name']} - {fx['teams']['away']['name']}")
-        lines.append(f"Lig: {fx['league']['name']} | Saat (TR): {kick.strftime('%H:%M')}")
-        pred = af_get("/predictions", {"fixture": fid})
-        if pred and pred.get("response"):
-            lines.extend(fmt_prediction(pred["response"][0]))
-        inj = af_get("/injuries", {"fixture": fid})
+        lines.append(
+            f"Lig: {lg['name']} ({lg.get('country')}) | Saat (TR): {kick.strftime('%H:%M')}"
+        )
+        lines.extend(fmt_prediction(p))
+        inj = af_get("/injuries", {"fixture": fx["fixture"]["id"]})
         if inj and inj.get("response"):
             lines.append("Eksikler: " + "; ".join(fmt_injuries(inj["response"])))
         lines.append("")
-    return "\n".join(lines), len(items)
+    return "\n".join(lines), len(selected)
 
 
 def fd_get(path, params=None):
@@ -240,17 +304,19 @@ def build_fd_data():
 def build_prompt(data_text: str) -> str:
     today = datetime.now(TR).strftime("%d.%m.%Y")
     return f"""Bugünün tarihi: {today}. Aşağıda futbol API'lerinden alınmış GERÇEK maç verileri var.
+Maçlar büyük liglerden ve milli takım karşılaşmalarından oluşuyor. API olasılığı en yüksek olanlar önceden seçildi.
 
 SADECE bu verilere dayanarak analiz yap. Veride olmayan bilgiyi uydurma.
 Bir maç için sakatlık/form verisi yoksa bunu o maçın risk notunda belirt.
 
 Görevin:
-1. Bu maçlar arasından en güvenilir en az 2-3 maçı seç. Gerçekten güvenilir olan daha fazlaysa hepsini ekle (en fazla 6).
-   Güvenilir maç yoksa zorlama ve bunu dürüstçe söyle.
+1. Bu maçlar arasından güvenilir gördüğün HER maçı yaz. En az 2-3 maç olmalı, ama güvenilir maç
+   daha fazlaysa hepsini ekle, sayı sınırı yok. Veriler sağlamsa gönderilen maçların çoğunu yazabilirsin.
+   Gerçekten güvenilir maç yoksa zorlama ve bunu dürüstçe söyle. Elenen maçlar için tek satırda neden elendiğini yaz.
 
 2. Seçtiğin HER maç için aşağıdaki şablonu doldur. Düşündüğün her şeyi ihtimalleriyle yaz:
 
-⚽ Maç adı | Lig | Saat (TR)
+⚽ Maç adı | Lig (ülke) | Saat (TR)
 
 🔢 SKOR BEKLENTİSİ
 - En olası skor: X-Y (yaklaşık %..)
@@ -275,7 +341,7 @@ Görevin:
 
 ⚠️ RİSK: Tek cümle (sakatlık/form verisi eksikse veya milli maçta rotasyon riski varsa belirt).
 
-3. Başa kısa bir "📅 Günün Özeti", sona "🏆 Günün En Güvenilir Seçimi" başlığı ekle ve oraya en güvenli 1-2 bahsi yaz.
+3. Başa kısa bir "📅 Günün Özeti", sona "🏆 Günün En Güvenilir Seçimi" başlığı ekle ve oraya en güvenli 1-3 bahsi yaz.
 4. En sona şu uyarıyı yaz: "Yüzdeler verilere dayalı tahmindir, istatistiksel garanti değildir. Oran verisi olmadığı için değer (value) analizi yapılmadı. Bahis risklidir."
 5. Milli maçlarda kadro rotasyonu ve hazırlık maçı motivasyonu risklidir, güven yüzdesini buna göre düşük tut.
 6. Veri azsa yüzdeleri uç değerlere çekme, belirsizliği yansıt.
@@ -361,7 +427,8 @@ def main():
         except Exception:
             pass
         sys.exit(1)
-    send_telegram(f"⚽🔥 GÜNLÜK FUTBOL BÜLTENİ — {today}\n\n{report}")
+    footer = "\n".join(diag)
+    send_telegram(f"⚽🔥 GÜNLÜK FUTBOL BÜLTENİ — {today}\n\n{report}\n\n🔧 {footer}")
 
 
 if __name__ == "__main__":
