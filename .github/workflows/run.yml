@@ -1,0 +1,27 @@
+name: Futbol Analiz Botu
+
+on:
+  schedule:
+    - cron: '0 7 * * *'  # Her gün Türkiye saatiyle sabah 10:00'da çalışır (UTC 07:00)
+  workflow_dispatch:      # İstersen GitHub'dan elinle de tek tıkla çalıştırabilirsin
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Kodları Depodan Çek
+        uses: actions/checkout@v4
+
+      - name: Python Ortamını Kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Gerekli Kütüphaneleri Yükle
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Botu Çalıştır
+        run: python bot.py
+        
