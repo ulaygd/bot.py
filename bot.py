@@ -6,10 +6,10 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"].strip()
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"].strip()
+TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"].strip()
+MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.1-flash-lite"]
 
 TR = ZoneInfo("Europe/Istanbul")
 
@@ -38,28 +38,32 @@ Sadece arama sonuçlarında doğrulayabildiğin bilgileri kullan; uydurma."""
 
 
 def ask_gemini(prompt: str) -> str:
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "tools": [{"google_search": {}}],
         "generationConfig": {"temperature": 0.3},
     }
     last_err = None
-    for attempt in range(3):
-        try:
-            r = requests.post(
-                url, params={"key": GEMINI_API_KEY}, json=body, timeout=180
-            )
-            r.raise_for_status()
-            data = r.json()
-            parts = data["candidates"][0]["content"]["parts"]
-            text = "".join(p.get("text", "") for p in parts).strip()
-            if text:
-                return text
-            last_err = "Boş yanıt"
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-        time.sleep(10 * (attempt + 1))
+    for model in MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        for attempt in range(2):
+            try:
+                r = requests.post(
+                    url, params={"key": GEMINI_API_KEY}, json=body, timeout=180
+                )
+                if r.status_code == 404:
+                    last_err = f"{model} bulunamadı"
+                    break
+                r.raise_for_status()
+                data = r.json()
+                parts = data["candidates"][0]["content"]["parts"]
+                text = "".join(p.get("text", "") for p in parts).strip()
+                if text:
+                    return text
+                last_err = "Boş yanıt"
+            except Exception as e:
+                last_err = e
+            time.sleep(10)
     raise RuntimeError(f"Gemini yanıt vermedi: {last_err}")
 
 
@@ -92,11 +96,10 @@ def main():
     try:
         report = ask_gemini(build_prompt())
         send_telegram(f"⚽🔥 GÜNLÜK FUTBOL BÜLTENİ — {today}\n\n{report}")
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         send_telegram(f"❌ Futbol botu hata verdi: {e}")
         sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
-    
