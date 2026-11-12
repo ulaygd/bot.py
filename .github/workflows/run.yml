@@ -2,8 +2,8 @@ name: Futbol Analiz Botu
 
 on:
   schedule:
-    - cron: '0 7 * * *'  # Her gün Türkiye saatiyle sabah 10:00'da çalışır (UTC 07:00)
-  workflow_dispatch:      # İstersen GitHub'dan elinle de tek tıkla çalıştırabilirsin
+    - cron: '0 7 * * *'  # Her gün Türkiye saatiyle sabah 10:00'da çalışır
+  workflow_dispatch:
 
 jobs:
   run-bot:
@@ -23,5 +23,8 @@ jobs:
           pip install -r requirements.txt
 
       - name: Botu Çalıştır
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: python bot.py
         
