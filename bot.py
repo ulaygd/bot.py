@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import time
@@ -10,34 +11,54 @@ import requests
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"].strip()
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"].strip()
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"].strip()
-FD_KEY = os.environ.get("FOOTBALL_DATA_API_KEY", "").strip()
+HL_KEY = os.environ.get("HIGHLIGHTLY_API_KEY", "").strip()
 AF_KEY = os.environ.get("API_FOOTBALL_KEY", "").strip()
+FD_KEY = os.environ.get("FOOTBALL_DATA_API_KEY", "").strip()
 MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.1-flash-lite"]
 
 TR = ZoneInfo("Europe/Istanbul")
-FD_BASE = "https://api.football-data.org/v4"
+HL_BASE = "https://sports.highlightly.net"
 AF_BASE = "https://v3.football.api-sports.io"
+FD_BASE = "https://api.football-data.org/v4"
 
-MAX_PRED = 40      # olasılık verisi çekilecek maç sayısı
-MAX_MATCHES = 20   # Gemini'ye gidecek en güvenilir maç sayısı
+HL_PRED = 20       # Highlightly: olasılık çekilecek maç sayısı
+HL_MAX = 14        # Highlightly: Gemini'ye gidecek maç sayısı
+AF_PRED = 20       # API-Football: olasılık çekilecek maç sayısı
+AF_MAX = 10        # API-Football: Gemini'ye gidecek maç sayısı
 FD_MAX = 10        # yedek kaynakta en fazla maç
+CALL_CAP = 95      # Highlightly günlük 100 istek sınırına karşı güvenlik
 
-# Süper Lig, Premier Lig, La Liga, Serie A, Bundesliga, Ligue 1,
-# Şampiyonlar Ligi, Avrupa Ligi, Konferans Ligi,
-# Hollanda, Portekiz, Belçika, Brezilya, Arjantin, MLS
+calls = [0]
+hl_errors = []
+diag = []
+
+# (lig adı parçası, ülke parçası) - Highlightly için
+TOP = [
+    ("super lig", "turk"), ("süper lig", "türk"),
+    ("premier league", "england"), ("la liga", "spain"),
+    ("serie a", "ital"), ("bundesliga", "german"),
+    ("ligue 1", "franc"), ("eredivisie", ""),
+    ("primeira liga", "portug"), ("pro league", "belg"),
+    ("serie a", "brazil"), ("liga profesional", "argentin"),
+    ("major league soccer", ""), ("mls", ""),
+]
+# API-Football lig ID'leri: Süper Lig, Premier Lig, La Liga, Serie A, Bundesliga,
+# Ligue 1, Şampiyonlar Ligi, Avrupa Ligi, Konferans Ligi, Hollanda, Portekiz,
+# Belçika, Brezilya, Arjantin, MLS
 TOP_IDS = {203, 39, 140, 135, 78, 61, 2, 3, 848, 88, 94, 144, 71, 128, 253}
 
-INTL_WORDS = (
+CUPS = ("champions league", "europa league", "conference league")
+INTL = (
     "friendl", "qualif", "nations league", "world cup", "euro",
-    "copa america", "africa cup", "asian cup", "gold cup",
+    "copa america", "africa cup", "asian cup", "gold cup", "international",
 )
-
 EXCLUDE = (
     "women", "femin", "u16", "u17", "u18", "u19", "u20", "u21", "u23",
     "youth", "reserve", "amateur", "clubs", "futsal", "beach",
+    "2. bundesliga", "bundesliga 2", "la liga 2", "laliga 2", "segunda",
+    "ligue 2", "serie b", "serie c", "championship", "league one",
+    "league two", "1. lig", "2. lig", "3. lig",
 )
-
-diag = []
 
 
 def get_window():
@@ -49,6 +70,247 @@ def get_window():
     return now, end
 
 
+def to_pct(v):
+    try:
+        f = float(str(v).replace("%", "").strip())
+    except Exception:
+        return 0.0
+    return f * 100 if f <= 1 else f
+
+
+def compact(obj, n):
+    try:
+        s = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        s = str(obj)
+    return s[:n]
+
+
+# =============== Highlightly ===============
+def hl_get(path, params=None):
+    if calls[0] >= CALL_CAP:
+        return None
+    calls[0] += 1
+    time.sleep(1.2)
+    try:
+        r = requests.get(
+            HL_BASE + path,
+            headers={"x-rapidapi-key": HL_KEY},
+            params=params,
+            timeout=40,
+        )
+    except Exception as e:
+        hl_errors.append(f"bağlantı hatası: {e}")
+        return None
+    if r.status_code != 200:
+        msg = f"{path} HTTP {r.status_code} {r.text[:150]}"
+        print("Highlightly " + msg)
+        if len(hl_errors) < 3:
+            hl_errors.append(msg)
+        return None
+    try:
+        return r.json()
+    except Exception:
+        hl_errors.append(f"{path} geçersiz JSON")
+        return None
+
+
+def name_of(x):
+    if isinstance(x, dict):
+        return str(x.get("name") or x.get("code") or "")
+    return str(x or "")
+
+
+def league_text(m):
+    return f"{name_of(m.get('league'))} ({name_of(m.get('country'))})"
+
+
+def parse_kick(m):
+    try:
+        return datetime.fromisoformat(str(m.get("date")).replace("Z", "+00:00")).astimezone(TR)
+    except Exception:
+        return None
+
+
+def hl_excluded(m):
+    text = (
+        f"{name_of(m.get('league'))} {name_of(m.get('homeTeam'))} {name_of(m.get('awayTeam'))}"
+    ).lower()
+    if any(w in text for w in EXCLUDE):
+        return True
+    h = name_of(m.get("homeTeam")).lower()
+    a = name_of(m.get("awayTeam")).lower()
+    return h.endswith(" w") or a.endswith(" w")
+
+
+def hl_priority(m):
+    lg = name_of(m.get("league")).lower()
+    text = f"{lg} {name_of(m.get('country')).lower()}"
+    if any(w in lg for w in INTL):
+        return 0
+    if any(w in lg for w in CUPS):
+        return 1
+    for league_kw, country_kw in TOP:
+        if league_kw in text and country_kw in text:
+            return 2
+    return 9
+
+
+def hl_wanted(m):
+    return (not hl_excluded(m)) and hl_priority(m) < 9
+
+
+def hl_matches(date_str):
+    out = []
+    offset = 0
+    for _ in range(8):
+        data = hl_get(
+            "/football/matches",
+            {"date": date_str, "limit": 100, "offset": offset, "timezone": "Europe/Istanbul"},
+        )
+        if not data:
+            break
+        if isinstance(data, dict):
+            items = data.get("data") or []
+            total = (data.get("pagination") or {}).get("totalCount", 0)
+        else:
+            items, total = data, 0
+        out.extend(items)
+        offset += 100
+        if not items or offset >= total:
+            break
+    return out
+
+
+def hl_detail(mid):
+    if not mid:
+        return None
+    data = hl_get(f"/football/matches/{mid}")
+    if isinstance(data, list):
+        return data[0] if data else None
+    if isinstance(data, dict):
+        inner = data.get("data")
+        if isinstance(inner, list) and inner:
+            return inner[0]
+        return data
+    return None
+
+
+def hl_probs(detail):
+    try:
+        pre = (detail.get("predictions") or {}).get("prematch") or []
+        if not pre:
+            return None, None
+        pr = pre[0].get("probabilities") or {}
+        probs = {k: to_pct(pr.get(k)) for k in ("home", "draw", "away")}
+        if max(probs.values()) <= 0:
+            return None, None
+        return probs, pre[0]
+    except Exception:
+        return None, None
+
+
+def build_hl_data():
+    if not HL_KEY:
+        diag.append("Highlightly: HIGHLIGHTLY_API_KEY bulunamadı")
+        return None, 0
+    now, end = get_window()
+    dates = sorted({now.date().isoformat(), end.date().isoformat()})
+
+    seen, fetched = set(), []
+    for d in dates:
+        for m in hl_matches(d):
+            mid = m.get("id")
+            if mid in seen:
+                continue
+            seen.add(mid)
+            fetched.append(m)
+    if not fetched:
+        diag.append("Highlightly: maç listesi boş geldi. " + " | ".join(hl_errors))
+        return None, 0
+
+    wanted = []
+    skipped = Counter()
+    in_window = 0
+    for m in fetched:
+        kick = parse_kick(m)
+        if kick is None or not (now <= kick < end):
+            continue
+        in_window += 1
+        if hl_wanted(m):
+            wanted.append((kick, m))
+        else:
+            skipped[league_text(m)] += 1
+
+    wanted.sort(key=lambda x: (hl_priority(x[1]), x[0]))
+    candidates = wanted[:HL_PRED]
+
+    rated = []
+    for kick, m in candidates:
+        detail = hl_detail(m.get("id"))
+        probs, pre = hl_probs(detail) if detail else (None, None)
+        conf = max(probs.values()) if probs else 0
+        rated.append((conf, kick, m, probs, pre))
+
+    with_pred = sum(1 for x in rated if x[3])
+    rated.sort(key=lambda x: x[0], reverse=True)
+    selected = rated[:HL_MAX]
+    selected.sort(key=lambda x: x[1])
+
+    diag.append(
+        f"Pencere: {now.strftime('%d.%m %H:%M')} - {end.strftime('%d.%m %H:%M')} | "
+        f"Highlightly: çekilen {len(fetched)}, pencerede {in_window}, uygun {len(wanted)}, "
+        f"incelenen {len(candidates)}, tahmin verisi olan {with_pred}"
+    )
+    if skipped:
+        top = ", ".join(f"{k} x{v}" for k, v in skipped.most_common(8))
+        diag.append("Highlightly elenen ligler: " + top)
+    if not selected:
+        diag.append("Highlightly: uygun maç yok. " + " | ".join(hl_errors))
+        return None, 0
+
+    team_cache = {}
+
+    def last_five(team):
+        tid = team.get("id") if isinstance(team, dict) else None
+        if not tid:
+            return None
+        if tid not in team_cache:
+            team_cache[tid] = hl_get(f"/football/last-five/{tid}")
+        return team_cache[tid]
+
+    lines = []
+    skipped_l5 = 0
+    for conf, kick, m, probs, pre in selected:
+        home, away = m.get("homeTeam") or {}, m.get("awayTeam") or {}
+        lines.append(f"MAÇ: {name_of(home)} - {name_of(away)}")
+        lines.append(
+            f"Lig: {league_text(m)} | Tarih/Saat (TR): {kick.strftime('%d.%m %H:%M')}"
+        )
+        if probs:
+            lines.append(
+                f"Sağlayıcı modeli olasılıkları % (ev/beraberlik/dep): "
+                f"{probs['home']:.0f} / {probs['draw']:.0f} / {probs['away']:.0f}"
+            )
+            lines.append(f"Model bilgisi: {compact(pre, 300)}")
+        else:
+            lines.append("Sağlayıcı tahmin verisi yok.")
+        l5h, l5a = last_five(home), last_five(away)
+        if l5h is None and l5a is None:
+            skipped_l5 += 1
+        lines.append(f"Ev sahibi son 5 maç (ham veri): {compact(l5h, 1500) if l5h else 'yok'}")
+        lines.append(f"Deplasman son 5 maç (ham veri): {compact(l5a, 1500) if l5a else 'yok'}")
+        lines.append("")
+
+    if skipped_l5:
+        diag.append(f"Highlightly: {skipped_l5} maçta son 5 maç verisi alınamadı")
+    diag.append(f"Highlightly istek sayısı: {calls[0]}/100")
+    if hl_errors:
+        diag.append("Highlightly hataları: " + " | ".join(hl_errors[:3]))
+    return "\n".join(lines), len(selected)
+
+
+# =============== API-Football ===============
 def af_get(path, params=None, note=False):
     time.sleep(6)
     try:
@@ -77,42 +339,33 @@ def af_get(path, params=None, note=False):
     return data
 
 
-def is_excluded(fx):
+def af_excluded(fx):
     lg = fx["league"]
     home, away = fx["teams"]["home"]["name"], fx["teams"]["away"]["name"]
     text = f"{lg['name']} {home} {away}".lower()
     if any(w in text for w in EXCLUDE):
         return True
-    if home.lower().endswith(" w") or away.lower().endswith(" w"):
-        return True
-    return False
+    return home.lower().endswith(" w") or away.lower().endswith(" w")
 
 
-def is_intl(fx):
+def af_intl(fx):
     lg = fx["league"]
     name = lg["name"].lower()
-    return lg.get("country") == "World" or any(w in name for w in INTL_WORDS)
+    return lg.get("country") == "World" or any(w in name for w in INTL)
 
 
-def is_wanted(fx):
-    if is_excluded(fx):
+def af_wanted(fx):
+    if af_excluded(fx):
         return False
-    return fx["league"]["id"] in TOP_IDS or is_intl(fx)
+    return fx["league"]["id"] in TOP_IDS or af_intl(fx)
 
 
-def pct(v):
-    try:
-        return int(str(v).replace("%", "").strip())
-    except Exception:
-        return 0
-
-
-def confidence(p):
+def af_conf(p):
     pc = (p.get("predictions", {}) or {}).get("percent") or {}
-    return max(pct(pc.get("home")), pct(pc.get("draw")), pct(pc.get("away")))
+    return max(to_pct(pc.get("home")), to_pct(pc.get("draw")), to_pct(pc.get("away")))
 
 
-def fmt_prediction(p):
+def af_fmt_prediction(p):
     lines = []
     pr = p.get("predictions", {}) or {}
     if pr.get("advice"):
@@ -166,7 +419,7 @@ def fmt_prediction(p):
     return lines
 
 
-def fmt_injuries(inj):
+def af_fmt_injuries(inj):
     items = []
     for i in inj[:8]:
         items.append(
@@ -177,6 +430,7 @@ def fmt_injuries(inj):
 
 def build_af_data():
     if not AF_KEY:
+        diag.append("API-Football: API_FOOTBALL_KEY bulunamadı")
         return None, 0
     now, end = get_window()
     dates = sorted({now.date().isoformat(), end.date().isoformat()})
@@ -199,42 +453,38 @@ def build_af_data():
         if not (now <= kick < end):
             continue
         in_window += 1
-        if is_wanted(fx):
+        if af_wanted(fx):
             wanted.append((kick, fx))
         else:
             lg = fx["league"]
             skipped[f"{lg['name']} ({lg.get('country')})"] += 1
 
-    # Önce milli maçlar, sonra büyük ligler; kendi içinde saat sırası
-    wanted.sort(key=lambda x: (0 if is_intl(x[1]) else 1, x[0]))
-    candidates = wanted[:MAX_PRED]
+    wanted.sort(key=lambda x: (0 if af_intl(x[1]) else 1, x[0]))
+    candidates = wanted[:AF_PRED]
 
     scored = []
-    nodata = []
+    nodata = 0
     for kick, fx in candidates:
         pred = af_get("/predictions", {"fixture": fx["fixture"]["id"]})
         if pred and pred.get("response"):
             p = pred["response"][0]
-            scored.append((confidence(p), kick, fx, p))
+            scored.append((af_conf(p), kick, fx, p))
         else:
-            nodata.append(f"{fx['teams']['home']['name']}-{fx['teams']['away']['name']}")
+            nodata += 1
 
     diag.append(
-        f"Pencere: {now.strftime('%d.%m %H:%M')} - {end.strftime('%d.%m %H:%M')} | "
         f"API-Football: pencerede {in_window} maç, uygun {len(wanted)}, "
-        f"incelenen {len(candidates)}, verisi olan {len(scored)}, verisi olmayan {len(nodata)}"
+        f"incelenen {len(candidates)}, verisi olan {len(scored)}, verisi olmayan {nodata}"
     )
-    if nodata:
-        diag.append("Veri alınamayan maçlar: " + ", ".join(nodata[:6]))
     if skipped:
-        top = ", ".join(f"{k} x{v}" for k, v in skipped.most_common(8))
-        diag.append("Elenen ligler: " + top)
+        top = ", ".join(f"{k} x{v}" for k, v in skipped.most_common(6))
+        diag.append("API-Football elenen ligler: " + top)
     if not scored:
         return None, 0
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    selected = scored[:MAX_MATCHES]
-    selected.sort(key=lambda x: x[1])  # bültende saat sırasıyla
+    selected = scored[:AF_MAX]
+    selected.sort(key=lambda x: x[1])
 
     lines = []
     for conf, kick, fx, p in selected:
@@ -243,14 +493,15 @@ def build_af_data():
         lines.append(
             f"Lig: {lg['name']} ({lg.get('country')}) | Tarih/Saat (TR): {kick.strftime('%d.%m %H:%M')}"
         )
-        lines.extend(fmt_prediction(p))
+        lines.extend(af_fmt_prediction(p))
         inj = af_get("/injuries", {"fixture": fx["fixture"]["id"]})
         if inj and inj.get("response"):
-            lines.append("Eksikler: " + "; ".join(fmt_injuries(inj["response"])))
+            lines.append("Eksikler: " + "; ".join(af_fmt_injuries(inj["response"])))
         lines.append("")
     return "\n".join(lines), len(selected)
 
 
+# =============== football-data.org (yedek) ===============
 def fd_get(path, params=None):
     time.sleep(7)
     for _ in range(2):
@@ -327,132 +578,19 @@ def build_fd_data():
     return "\n".join(lines), len(matches)
 
 
+# =============== Gemini ===============
 def build_prompt(data_text: str) -> str:
     now, end = get_window()
     return f"""Bugünün tarihi: {now.strftime('%d.%m.%Y')}. Kapsanan zaman aralığı (Türkiye saati):
 {now.strftime('%d.%m %H:%M')} - {end.strftime('%d.%m %H:%M')}.
-Aşağıda futbol API'lerinden alınmış GERÇEK maç verileri var (büyük ligler ve milli takım maçları).
+Aşağıda futbol API'lerinden alınmış GERÇEK maç verileri var (büyük ligler, kupalar ve milli takım maçları).
+Veri bir veya iki KAYNAKTAN gelebilir. Aynı maç iki kaynakta da varsa onu TEK maç olarak yaz ve iki kaynağın
+verisini birleştirerek kullan (takım adları farklı yazılmış olabilir).
+"Son 5 maç (ham veri)" JSON halindedir: oradan takımların son sonuçlarını, attığı/yediği golleri kendin çıkar
+ve ortalamaları hesapla. Sağlayıcı olasılıkları ev/beraberlik/deplasman içindir.
 
-SADECE bu verilere dayanarak analiz yap. Veride olmayan bilgiyi uydurma.
-Bir maç için sakatlık/form verisi yoksa bunu o maçın risk notunda belirt.
+SADECE bu verilere dayanarak analiz yap. Veride olmayan bilgiyi (oran, kadro) uydurma.
+Bir maç için veri eksikse (son 5 maç yok, tahmin yok, sakatlık verisi yok) bunu o maçın risk notunda belirt ve güveni düşük tut.
 
 Görevin:
-1. Güvenilir gördüğün HER maçı yaz. En az 2-3 maç olmalı, güvenilir maç daha fazlaysa hepsini ekle, sayı sınırı yok.
-   Gerçekten güvenilir maç yoksa zorlama ve bunu dürüstçe söyle. Elenen maçlar için tek satırda neden elendiğini yaz.
-   Maçları saat sırasıyla yaz.
-
-2. Seçtiğin HER maç için şu şablonu doldur (kısa ve net tut, çok maç olabilir):
-
-⚽ Maç adı | Lig (ülke) | Tarih Saat (TR)
-🔢 Skor beklentisi: en olası X-Y (%..), alternatifler X-Y (%..), X-Y (%..) | beklenen toplam gol ~..
-📊 MS1 %.. MS0 %.. MS2 %.. | Çifte şans 1-0 %.. 0-2 %.. 1-2 %..
-📊 Alt/Üst 1.5: Alt %.. Üst %.. | 2.5: Alt %.. Üst %.. | 3.5: Alt %.. Üst %.. | KG Var %.. KG Yok %..
-🧠 Neden: hangi veri neyi destekliyor (gol ortalamaları, form, h2h, eksikler, API olasılıkları) 2-3 madde.
-🎯 EN MANTIKLI BAHİS: ... (güven %..) | neden bu: MS, KG, Alt/Üst ve Çifte şansı kıyasla.
-   Örnek: "MS1 %48 ama KG Var %68, bu yüzden KG Var daha mantıklı." En fazla bir alternatif bahis ekle.
-⚠️ Risk: tek cümle.
-
-3. Başa kısa bir "📅 Günün Özeti" ekle.
-
-4. En sona "🎟️ KUPONLAR" bölümü ekle. Yukarıda yazdığın maçlardan, her maçtan EN FAZLA BİR seçim alarak:
-   - 🟢 Sağlam Kupon: en yüksek güvenli 2-3 seçim.
-   - 🟡 Dengeli Kupon: en güvenli 4-5 seçim (sağlam kupondakileri içerebilir).
-   Her kupon için: maç, seçim, güven %, ve tahmini birleşik ihtimal (seçimlerin yüzdelerinin çarpımı, hesaplayıp yaz).
-   Oran verisi olmadığı için toplam oranı hesaplama; kullanıcı oranları kendisi bahis sitesinden çarpabilir, bunu yaz.
-   Seçim sayısı arttıkça birleşik ihtimalin hızla düştüğünü bir cümleyle belirt.
-   Aynı seçimleri iki kupona koymak serbest ama kuponları farklı tutmaya çalış. Uygun seçim azsa kuponu küçük tut veya "uygun seçim yok" yaz.
-
-5. En sona şu uyarıyı yaz: "Yüzdeler verilere dayalı tahmindir, istatistiksel garanti değildir. Oran verisi olmadığı için değer (value) analizi yapılmadı. Bahis risklidir."
-6. Milli maçlarda kadro rotasyonu ve hazırlık maçı motivasyonu risklidir, güven yüzdesini buna göre düşük tut.
-7. Veri azsa yüzdeleri uç değerlere çekme, belirsizliği yansıt. Yüzdeler tutarlı olsun (MS toplamı ~%100).
-
-Kurallar: Türkçe yaz, bol emoji kullan, Markdown işareti (*, _, #) KULLANMA, düz metin ve emoji yaz.
-
-VERİLER:
-{data_text}"""
-
-
-def ask_gemini(prompt: str) -> str:
-    body = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 32000},
-    }
-    errors = []
-    for model in MODELS:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        try:
-            r = requests.post(
-                url, params={"key": GEMINI_API_KEY}, json=body, timeout=300
-            )
-            if r.status_code == 200:
-                parts = r.json()["candidates"][0]["content"]["parts"]
-                text = "".join(p.get("text", "") for p in parts).strip()
-                if text:
-                    return text
-                errors.append(f"{model}: boş yanıt")
-            else:
-                msg = f"{model}: {r.status_code} {r.text[:300]}"
-                print(msg)
-                errors.append(msg)
-        except Exception as e:
-            errors.append(f"{model}: {e}")
-        time.sleep(5)
-    raise RuntimeError("Gemini hatası: " + " | ".join(errors))
-
-
-def chunk(text: str, limit: int = 3800):
-    parts, cur = [], ""
-    for para in text.split("\n\n"):
-        if len(cur) + len(para) + 2 > limit and cur:
-            parts.append(cur)
-            cur = ""
-        cur += para + "\n\n"
-    if cur.strip():
-        parts.append(cur)
-    return parts
-
-
-def send_telegram(text: str):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    for part in chunk(text):
-        r = requests.post(
-            url,
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": part.strip()},
-            timeout=30,
-        )
-        if r.status_code != 200:
-            print(f"Telegram hatası: {r.status_code} {r.text[:300]}")
-        r.raise_for_status()
-        time.sleep(1)
-
-
-def main():
-    now, end = get_window()
-    title = (
-        f"⚽🔥 GÜNLÜK FUTBOL BÜLTENİ — {now.strftime('%d.%m.%Y')}\n"
-        f"🕕 {now.strftime('%d.%m %H:%M')} → {end.strftime('%d.%m %H:%M')} arası maçlar"
-    )
-    try:
-        data_text, count = build_af_data()
-        if not data_text:
-            data_text, count = build_fd_data()
-        if not data_text:
-            note = "\n".join(diag) if diag else "Kaynaklardan veri alınamadı."
-            send_telegram(
-                f"{title}\n\nBu aralıkta analiz edilecek maç bulunamadı. 😴\n\n🔧 Kaynak durumu:\n{note}"
-            )
-            return
-        report = ask_gemini(build_prompt(data_text))
-    except Exception as e:
-        print(e)
-        try:
-            send_telegram(f"❌ Futbol botu hata verdi: {str(e)[:1500]}")
-        except Exception:
-            pass
-        sys.exit(1)
-    footer = "\n".join(diag)
-    send_telegram(f"{title}\n\n{report}\n\n🔧 {footer}")
-
-
-if __name__ == "__main__":
-    main()
+1. Güvenilir gördüğün HER maçı yaz. En az 2-3 maç olmalı, güvenilir maç daha fazlaysa hepsini ekle, sayı s
