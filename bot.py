@@ -575,9 +575,7 @@ def build_fd_data():
                     f"averaj {row['goalsFor']}-{row['goalsAgainst']}"
                 )
         lines.append("")
-    return "\n".join(lines), len(matches)
-
-
+    return "\n".join(lines), len(matches) 
 # =============== Gemini ===============
 def build_prompt(data_text: str) -> str:
     now, end = get_window()
@@ -593,4 +591,131 @@ SADECE bu verilere dayanarak analiz yap. Veride olmayan bilgiyi (oran, kadro) uy
 Bir maç için veri eksikse (son 5 maç yok, tahmin yok, sakatlık verisi yok) bunu o maçın risk notunda belirt ve güveni düşük tut.
 
 Görevin:
-1. Güvenilir gördüğün HER maçı yaz. En az 2-3 maç olmalı, güvenilir maç daha fazlaysa hepsini ekle, sayı s
+1. Güvenilir gördüğün HER maçı yaz. En az 2-3 maç olmalı, güvenilir maç daha fazlaysa hepsini ekle, sayı sınırı yok.
+   Gerçekten güvenilir maç yoksa zorlama ve bunu dürüstçe söyle. Elenen maçlar için tek satırda neden elendiğini yaz.
+   Maçları saat sırasıyla yaz.
+
+2. Seçtiğin HER maç için şu şablonu doldur (kısa ve net tut, çok maç olabilir):
+
+⚽ Maç adı | Lig (ülke) | Tarih Saat (TR)
+🔢 Skor beklentisi: en olası X-Y (%..), alternatifler X-Y (%..), X-Y (%..) | beklenen toplam gol ~..
+📊 MS1 %.. MS0 %.. MS2 %.. | Çifte şans 1-0 %.. 0-2 %.. 1-2 %..
+📊 Alt/Üst 1.5: Alt %.. Üst %.. | 2.5: Alt %.. Üst %.. | 3.5: Alt %.. Üst %.. | KG Var %.. KG Yok %..
+🧠 Neden: hangi veri neyi destekliyor (son 5 maç gol ortalamaları, form, sağlayıcı olasılıkları, h2h, eksikler) 2-3 madde.
+🎯 EN MANTIKLI BAHİS: ... (güven %..) | neden bu: MS, KG, Alt/Üst ve Çifte şansı kıyasla.
+   Örnek: "MS1 %48 ama KG Var %68, bu yüzden KG Var daha mantıklı." En fazla bir alternatif bahis ekle.
+⚠️ Risk: tek cümle.
+
+3. Başa kısa bir "📅 Günün Özeti" ekle.
+
+4. En sona "🎟️ KUPONLAR" bölümü ekle. Yukarıda yazdığın maçlardan, her maçtan EN FAZLA BİR seçim alarak:
+   - 🟢 Sağlam Kupon: en yüksek güvenli 2-3 seçim.
+   - 🟡 Dengeli Kupon: en güvenli 4-5 seçim (sağlam kupondakileri içerebilir).
+   Her kupon için: maç, seçim, güven %, ve tahmini birleşik ihtimal (seçimlerin yüzdelerinin çarpımı, hesaplayıp yaz).
+   Oran verisi olmadığı için toplam oranı hesaplama; kullanıcı oranları kendisi bahis sitesinden çarpabilir, bunu yaz.
+   Seçim sayısı arttıkça birleşik ihtimalin hızla düştüğünü bir cümleyle belirt.
+   Uygun seçim azsa kuponu küçük tut veya "uygun seçim yok" yaz.
+
+5. En sona şu uyarıyı yaz: "Yüzdeler verilere dayalı tahmindir, istatistiksel garanti değildir. Oran verisi olmadığı için değer (value) analizi yapılmadı. Bahis risklidir."
+6. Milli maçlarda kadro rotasyonu ve hazırlık maçı motivasyonu risklidir, güven yüzdesini buna göre düşük tut.
+7. Veri azsa yüzdeleri uç değerlere çekme, belirsizliği yansıt. Yüzdeler tutarlı olsun (MS toplamı ~%100).
+
+Kurallar: Türkçe yaz, bol emoji kullan, Markdown işareti (*, _, #) KULLANMA, düz metin ve emoji yaz.
+
+VERİLER:
+{data_text}"""
+
+
+def ask_gemini(prompt: str) -> str:
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 32000},
+    }
+    errors = []
+    for model in MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        try:
+            r = requests.post(
+                url, params={"key": GEMINI_API_KEY}, json=body, timeout=300
+            )
+            if r.status_code == 200:
+                parts = r.json()["candidates"][0]["content"]["parts"]
+                text = "".join(p.get("text", "") for p in parts).strip()
+                if text:
+                    return text
+                errors.append(f"{model}: boş yanıt")
+            else:
+                msg = f"{model}: {r.status_code} {r.text[:300]}"
+                print(msg)
+                errors.append(msg)
+        except Exception as e:
+            errors.append(f"{model}: {e}")
+        time.sleep(5)
+    raise RuntimeError("Gemini hatası: " + " | ".join(errors))
+
+
+# =============== Telegram ===============
+def chunk(text: str, limit: int = 3800):
+    parts, cur = [], ""
+    for para in text.split("\n\n"):
+        if len(cur) + len(para) + 2 > limit and cur:
+            parts.append(cur)
+            cur = ""
+        cur += para + "\n\n"
+    if cur.strip():
+        parts.append(cur)
+    return parts
+
+
+def send_telegram(text: str):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    for part in chunk(text):
+        r = requests.post(
+            url,
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": part.strip()},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            print(f"Telegram hatası: {r.status_code} {r.text[:300]}")
+        r.raise_for_status()
+        time.sleep(1)
+
+
+def main():
+    now, end = get_window()
+    title = (
+        f"⚽🔥 GÜNLÜK FUTBOL BÜLTENİ — {now.strftime('%d.%m.%Y')}\n"
+        f"🕕 {now.strftime('%d.%m %H:%M')} → {end.strftime('%d.%m %H:%M')} arası maçlar"
+    )
+    try:
+        sections = []
+        t1, _ = build_hl_data()
+        if t1:
+            sections.append("=== KAYNAK 1: Highlightly ===\n" + t1)
+        t2, _ = build_af_data()
+        if t2:
+            sections.append("=== KAYNAK 2: API-Football ===\n" + t2)
+        if not sections:
+            t3, _ = build_fd_data()
+            if t3:
+                sections.append("=== KAYNAK: football-data.org ===\n" + t3)
+        if not sections:
+            note = "\n".join(diag) if diag else "Kaynaklardan veri alınamadı."
+            send_telegram(
+                f"{title}\n\nBu aralıkta analiz edilecek maç bulunamadı. 😴\n\n🔧 Kaynak durumu:\n{note}"
+            )
+            return
+        report = ask_gemini(build_prompt("\n\n".join(sections)))
+    except Exception as e:
+        print(e)
+        try:
+            send_telegram(f"❌ Futbol botu hata verdi: {str(e)[:1500]}")
+        except Exception:
+            pass
+        sys.exit(1)
+    footer = "\n".join(diag)
+    send_telegram(f"{title}\n\n{report}\n\n🔧 {footer}")
+
+
+if __name__ == "__main__":
+    main()
