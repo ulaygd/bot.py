@@ -601,7 +601,7 @@ def build_fd_data():
         code = m["competition"]["code"]
         lines.append(f"MAÇ: {m['homeTeam']['name']} - {m['awayTeam']['name']}")
         lines.append(
-            f"Lig: {m['competition']['name']} | Tarih/Saat (TR): {kick.strftime('%d.%m %H:%M')}"
+            f"Lig: {m['competition']['name']} | Tarih/Saat (TR): {kick.strftime('%d.%m %H:%M')}")
         # =============== Gemini ===============
 def build_prompt(data_text: str) -> str:
     now, end = get_window()
