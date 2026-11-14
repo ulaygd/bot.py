@@ -21,11 +21,15 @@ HL_BASE = "https://sports.highlightly.net"
 AF_BASE = "https://v3.football.api-sports.io"
 FD_BASE = "https://api.football-data.org/v4"
 
-HL_PRED = 22       # Highlightly: olasılık çekilecek maç sayısı
-HL_MAX = 16        # Highlightly: Gemini'ye gidecek toplam maç sayısı
-AF_PRED = 20       # API-Football: olasılık çekilecek maç sayısı
-AF_MAX = 10        # API-Football: Gemini'ye gidecek toplam maç sayısı
-NAT_MAX = 16       # her kaynakta garanti verilen en fazla milli maç
+# Aday dengesi: her kaynakta hem milli hem kulüp maçı incelenir
+HL_NAT_CAND = 10   # Highlightly: olasılık çekilecek milli maç sayısı
+HL_CLUB_CAND = 12  # Highlightly: olasılık çekilecek kulüp maçı sayısı
+HL_NAT_KEEP = 6    # Highlightly: Gemini'ye giden en güvenilir milli maç sayısı
+HL_MAX = 14        # Highlightly: Gemini'ye giden toplam maç sayısı
+AF_NAT_CAND = 8
+AF_CLUB_CAND = 12
+AF_NAT_KEEP = 4
+AF_MAX = 10
 FD_MAX = 10        # yedek kaynakta en fazla maç
 CALL_CAP = 95      # Highlightly günlük 100 istek sınırına karşı güvenlik
 
@@ -91,13 +95,22 @@ def compact(obj, n):
     return s[:n]
 
 
-def pick(rated, max_n):
-    """Milli maçlar garanti, kalan yer en yüksek güvenli kulüp maçlarına.
+def balance(wanted, is_nat, n_nat, n_club):
+    """Aday listesini milli ve kulüp maçları arasında dengeler.
+    wanted: (kick, match) listesi, öncelik sırasına göre dizili."""
+    nat = [x for x in wanted if is_nat(x[1])][:n_nat]
+    club = [x for x in wanted if not is_nat(x[1])]
+    total = n_nat + n_club
+    return nat + club[: max(0, total - len(nat))]
+
+
+def pick(rated, nat_keep, max_n):
+    """Her türden en güvenilir maçları alır, güvene göre sıralar (karışık liste).
     rated: (conf, kick, match, ..., nat) - nat her zaman son eleman."""
-    nat = [x for x in rated if x[-1]][:NAT_MAX]
+    nat = sorted([x for x in rated if x[-1]], key=lambda x: x[0], reverse=True)[:nat_keep]
     others = sorted([x for x in rated if not x[-1]], key=lambda x: x[0], reverse=True)
     selected = nat + others[: max(0, max_n - len(nat))]
-    selected.sort(key=lambda x: x[1])
+    selected.sort(key=lambda x: x[0], reverse=True)
     return selected
 
 
@@ -265,7 +278,7 @@ def build_hl_data():
             skipped[league_text(m)] += 1
 
     wanted.sort(key=lambda x: (hl_priority(x[1]), x[0]))
-    candidates = wanted[:HL_PRED]
+    candidates = balance(wanted, hl_nat, HL_NAT_CAND, HL_CLUB_CAND)
 
     rated = []
     for kick, m in candidates:
@@ -275,14 +288,14 @@ def build_hl_data():
         rated.append((conf, kick, m, probs, pre, hl_nat(m)))
 
     with_pred = sum(1 for x in rated if x[3])
-    selected = pick(rated, HL_MAX)
+    selected = pick(rated, HL_NAT_KEEP, HL_MAX)
     nat_count = sum(1 for x in selected if x[-1])
 
     diag.append(
         f"Pencere: {now.strftime('%d.%m %H:%M')} - {end.strftime('%d.%m %H:%M')} | "
         f"Highlightly: çekilen {len(fetched)}, pencerede {in_window}, uygun {len(wanted)}, "
         f"incelenen {len(candidates)}, tahmin verisi olan {with_pred}, "
-        f"seçilen {len(selected)} (milli {nat_count})"
+        f"seçilen {len(selected)} (milli {nat_count}, kulüp {len(selected) - nat_count})"
     )
     if all_leagues:
         top_all = ", ".join(f"{k} x{v}" for k, v in all_leagues.most_common(12))
@@ -309,7 +322,7 @@ def build_hl_data():
     for conf, kick, m, probs, pre, nat in selected:
         home, away = m.get("homeTeam") or {}, m.get("awayTeam") or {}
         lines.append(f"MAÇ: {name_of(home)} - {name_of(away)}")
-        lines.append(f"TÜR: {'🌍 MİLLİ TAKIM MAÇI' if nat else 'Kulüp maçı'}")
+        lines.append(f"TÜR: {'🌍 milli takım maçı' if nat else '🏟️ kulüp maçı'}")
         lines.append(
             f"Lig: {league_text(m)} | Tarih/Saat (TR): {kick.strftime('%d.%m %H:%M')}"
         )
@@ -493,7 +506,7 @@ def build_af_data():
             skipped[label] += 1
 
     wanted.sort(key=lambda x: (0 if af_nat(x[1]) else 1, x[0]))
-    candidates = wanted[:AF_PRED]
+    candidates = balance(wanted, af_nat, AF_NAT_CAND, AF_CLUB_CAND)
 
     scored = []
     nodata = 0
@@ -505,13 +518,13 @@ def build_af_data():
         else:
             nodata += 1
 
-    selected = pick(scored, AF_MAX)
+    selected = pick(scored, AF_NAT_KEEP, AF_MAX)
     nat_count = sum(1 for x in selected if x[-1])
 
     diag.append(
         f"API-Football: pencerede {in_window} maç, uygun {len(wanted)}, "
         f"incelenen {len(candidates)}, verisi olan {len(scored)}, verisi olmayan {nodata}, "
-        f"seçilen {len(selected)} (milli {nat_count})"
+        f"seçilen {len(selected)} (milli {nat_count}, kulüp {len(selected) - nat_count})"
     )
     if all_leagues:
         top_all = ", ".join(f"{k} x{v}" for k, v in all_leagues.most_common(10))
@@ -526,7 +539,7 @@ def build_af_data():
     for conf, kick, fx, p, nat in selected:
         lg = fx["league"]
         lines.append(f"MAÇ: {fx['teams']['home']['name']} - {fx['teams']['away']['name']}")
-        lines.append(f"TÜR: {'🌍 MİLLİ TAKIM MAÇI' if nat else 'Kulüp maçı'}")
+        lines.append(f"TÜR: {'🌍 milli takım maçı' if nat else '🏟️ kulüp maçı'}")
         lines.append(
             f"Lig: {lg['name']} ({lg.get('country')}) | Tarih/Saat (TR): {kick.strftime('%d.%m %H:%M')}"
         )
@@ -584,31 +597,14 @@ def build_fd_data():
     if not matches:
         return None, 0
 
-    codes = sorted({m["competition"]["code"] for _, m in matches})
-    standings = {}
-    for code in codes:
-        d = fd_get(f"/competitions/{code}/standings")
-        table = {}
-        if d:
-            for st in d.get("standings", []):
-                if st.get("type") == "TOTAL":
-                    for row in st.get("table", []):
-                        table[row["team"]["id"]] = row
-        standings[code] = table
-
-    lines = []
-    for kick, m in matches:
-        code = m["competition"]["code"]
-        lines.append(f"MAÇ: {m['homeTeam']['name']} - {m['awayTeam']['name']}")
-        lines.append(
-            f"Lig: {m['competition']['name']} | Tarih/Saat (TR): {kick.strftime('%d.%m %H:%M')}")
-        # =============== Gemini ===============
+    codes = sorted({m["
+    # =============== Gemini ===============
 def build_prompt(data_text: str) -> str:
     now, end = get_window()
     return f"""Bugünün tarihi: {now.strftime('%d.%m.%Y')}. Kapsanan zaman aralığı (Türkiye saati):
 {now.strftime('%d.%m %H:%M')} - {end.strftime('%d.%m %H:%M')}.
-Aşağıda futbol API'lerinden alınmış GERÇEK maç verileri var (büyük ligler, kupalar ve milli takım maçları).
-Her maçta "TÜR" satırı var: "🌍 MİLLİ TAKIM MAÇI" veya "Kulüp maçı".
+Aşağıda futbol API'lerinden alınmış GERÇEK maç verileri var. Milli takım maçları ve kulüp (lig/kupa) maçları karışık.
+Her maçta "TÜR" satırı var: "🌍 milli takım maçı" veya "🏟️ kulüp maçı".
 Veri bir veya iki KAYNAKTAN gelebilir. Aynı maç iki kaynakta da varsa onu TEK maç olarak yaz ve iki kaynağın
 verisini birleştirerek kullan (takım adları farklı yazılmış olabilir).
 "Son 5 maç (ham veri)" JSON halindedir: oradan takımların son sonuçlarını, attığı/yediği golleri kendin çıkar
@@ -618,17 +614,17 @@ SADECE bu verilere dayanarak analiz yap. Veride olmayan bilgiyi (oran, kadro) uy
 Bir maç için veri eksikse (son 5 maç yok, tahmin yok, sakatlık verisi yok) bunu o maçın risk notunda belirt ve güveni düşük tut.
 
 Görevin:
-1. MİLLİ TAKIM MAÇLARINI ASLA ATLAMA. "🌍 MİLLİ TAKIM MAÇI" yazan HER maçı analiz et ve "🌍 MİLLİ MAÇLAR"
-   başlığı altında yaz. Güven düşükse veya veri azsa bunu risk notunda belirt, ama maç listede olsun.
-   Ardından "🏟️ KULÜP MAÇLARI" başlığı altında kulüp maçlarından güvenilir gördüğün HER maçı yaz
-   (Afrika ve diğer kıtaların kulüp maçları dahil).
-   Kulüp maçlarında en az 2-3 güvenilir maç ara, daha fazlası güvenilirse hepsini ekle, sayı sınırı yok.
-   Kulüp maçlarında gerçekten güvenilir olan yoksa zorlama ve bunu dürüstçe söyle.
-   Elenen kulüp maçları için tek satırda neden elendiğini yaz. Her başlıkta maçları saat sırasıyla yaz.
+1. Gönderilen maçlar arasından SADECE güvenilir, riski az olanları seç. Milli takım ve kulüp maçlarını AYRI
+   BAŞLIKLARA BÖLME: hepsini tek bir "🎯 GÜNÜN SEÇİMLERİ" listesinde, güven yüzdesine göre en güvenilirden başlayarak
+   KARIŞIK yaz. Her maçın başına türünü göster (🌍 veya 🏟️).
+   En az 2-3 maç olmalı, güvenilir maç daha fazlaysa hepsini ekle, sayı sınırı yok. Hem milli hem kulüp maçı
+   güvenilirse listede ikisi de olsun; sadece bir türden olsun diye zorlama, ama o türde güvenilir maç varsa dışarıda bırakma.
+   Güvenilir olmayan maçları listeye alma. Elenenleri sonda tek satırda kısa nedenleriyle yaz.
+   Hiç güvenilir maç yoksa zorlama ve bunu dürüstçe söyle.
 
-2. Yazdığın HER maç için şu şablonu doldur (kısa ve net tut, çok maç olabilir):
+2. Yazdığın HER maç için şu şablonu doldur (kısa ve net tut):
 
-⚽ Maç adı | Lig (ülke) | Tarih Saat (TR)
+🌍/🏟️ Maç adı | Lig (ülke) | Tarih Saat (TR)
 🔢 Skor beklentisi: en olası X-Y (%..), alternatifler X-Y (%..), X-Y (%..) | beklenen toplam gol ~..
 📊 MS1 %.. MS0 %.. MS2 %.. | Çifte şans 1-0 %.. 0-2 %.. 1-2 %..
 📊 Alt/Üst 1.5: Alt %.. Üst %.. | 2.5: Alt %.. Üst %.. | 3.5: Alt %.. Üst %.. | KG Var %.. KG Yok %..
@@ -637,9 +633,10 @@ Görevin:
    Örnek: "MS1 %48 ama KG Var %68, bu yüzden KG Var daha mantıklı." En fazla bir alternatif bahis ekle.
 ⚠️ Risk: tek cümle.
 
-3. Başa kısa bir "📅 Günün Özeti" ekle (kaç milli, kaç kulüp maçı yazdığını belirt).
+3. Başa kısa bir "📅 Günün Özeti" ekle (kaç maç seçtiğini ve kaçının milli, kaçının kulüp maçı olduğunu belirt).
 
-4. En sona "🎟️ KUPONLAR" bölümü ekle. Yukarıda yazdığın maçlardan, her maçtan EN FAZLA BİR seçim alarak:
+4. En sona "🎟️ KUPONLAR" bölümü ekle. Yukarıdaki maçlardan, her maçtan EN FAZLA BİR seçim alarak ve
+   milli/kulüp maçlarını karıştırarak:
    - 🟢 Sağlam Kupon: en yüksek güvenli 2-3 seçim.
    - 🟡 Dengeli Kupon: en güvenli 4-5 seçim (sağlam kupondakileri içerebilir).
    Her kupon için: maç, seçim, güven %, ve tahmini birleşik ihtimal (seçimlerin yüzdelerinin çarpımı, hesaplayıp yaz).
