@@ -597,8 +597,38 @@ def build_fd_data():
     if not matches:
         return None, 0
 
-    codes = sorted({m["
-    # =============== Gemini ===============
+    codes = sorted({m["competition"]["code"] for _, m in matches})
+    standings = {}
+    for code in codes:
+        d = fd_get(f"/competitions/{code}/standings")
+        table = {}
+        if d:
+            for st in d.get("standings", []):
+                if st.get("type") == "TOTAL":
+                    for row in st.get("table", []):
+                        table[row["team"]["id"]] = row
+        standings[code] = table
+
+    lines = []
+    for kick, m in matches:
+        code = m["competition"]["code"]
+        lines.append(f"MAÇ: {m['homeTeam']['name']} - {m['awayTeam']['name']}")
+        lines.append(
+            f"Lig: {m['competition']['name']} | Tarih/Saat (TR): {kick.strftime('%d.%m %H:%M')}"
+        )
+        for label, t in (("Ev sahibi", m["homeTeam"]), ("Deplasman", m["awayTeam"])):
+            row = standings[code].get(t["id"])
+            if row:
+                lines.append(
+                    f"{label} puan durumu: {row['position']}. sıra, {row['playedGames']} maç, "
+                    f"{row['won']}G {row['draw']}B {row['lost']}M, {row['points']} puan, "
+                    f"averaj {row['goalsFor']}-{row['goalsAgainst']}"
+                )
+        lines.append("")
+    return "\n".join(lines), len(matches)
+
+
+# =============== Gemini ===============
 def build_prompt(data_text: str) -> str:
     now, end = get_window()
     return f"""Bugünün tarihi: {now.strftime('%d.%m.%Y')}. Kapsanan zaman aralığı (Türkiye saati):
