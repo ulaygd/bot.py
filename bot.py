@@ -17,7 +17,7 @@ MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.1-flash-lite", "gemi
 
 TR = ZoneInfo("Europe/Istanbul")
 HL = "https://sports.highlightly.net"
-NAT_CAND, CLUB_CAND, NAT_KEEP, MAX_M, CAP = 10, 12, 6, 14, 95
+NAT_CAND, CLUB_CAND, NAT_KEEP, MAX_M, CAP = 40, 22, 9, 14, 95
 
 calls = [0]
 errs = []
@@ -53,6 +53,7 @@ GÖREV:
 1. Sadece güvenilir, riski az maçları seç. Milli ve kulüp maçlarını AYRI BAŞLIKLARA BÖLME: tek bir "🎯 GÜNÜN SEÇİMLERİ" listesinde, güvene göre en güvenilirden başlayarak karışık yaz, her maçın başına 🌍 veya 🏟️ koy. En az 2-3 maç, güvenilir olan daha fazlaysa hepsi (sınır yok). Güvenilmeyenleri alma, sonda tek satırda nedenleriyle yaz. Hiç güvenilir maç yoksa bunu dürüstçe söyle.
 2. Her maç için:
 🌍/🏟️ Maç | Lig (ülke) | Tarih Saat (TR)
+🔎 Sağlayıcı: ev %.. | beraberlik %.. | dep %.. (verideki sayıları aynen yaz)
 🔢 Skor beklentisi: en olası X-Y (%..), alternatifler X-Y (%..), X-Y (%..) | beklenen toplam gol ~..
 📊 MS1 %.. MS0 %.. MS2 %.. | Çifte şans 1-0 %.. 0-2 %.. 1-2 %..
 📊 Alt/Üst 1.5, 2.5, 3.5 (Alt %.. Üst %..) | KG Var %.. KG Yok %..
@@ -63,6 +64,8 @@ GÖREV:
 4. Sona "🎟️ KUPONLAR": her maçtan en fazla bir seçimle, milli ve kulüp karışık. 🟢 Sağlam Kupon (2-3 seçim), 🟡 Dengeli Kupon (4-5 seçim). Her kupon için maç, seçim, güven % ve tahmini birleşik ihtimal (yüzdelerin çarpımı, hesapla). Oran verisi yok, toplam oranı hesaplama, kullanıcı oranları kendisi çarpar. Seçim arttıkça birleşik ihtimalin hızla düştüğünü bir cümleyle belirt.
 5. En sona: "Yüzdeler verilere dayalı tahmindir, garanti değildir. Oran verisi olmadığı için değer analizi yapılmadı. Bahis risklidir."
 6. Milli maçlarda rotasyon ve hazırlık maçı motivasyonu risklidir, güveni düşük tut. Yüzdeler tutarlı olsun (MS toplamı ~%100).
+7. MS1 = ev sahibi, MS2 = deplasman kazanır; ev sahibi ile deplasmanı karıştırma. Favoriyi sağlayıcı olasılığına göre belirle. Kendi yüzdelerin sağlayıcıdan en fazla ~10 puan sapabilir; saparsan nedenini son 5 maç verisiyle yaz. "Kesin" veya "garanti" deme, %95 üstü yüzde verme. Rakip gücü (kimlere karşı oynadıkları) veride yoksa bunu risk notunda belirt.
+8. Maçın saati güveni etkilemez: gece geç saatteki maçları da erken saatteki maçlar gibi değerlendir.
 Kurallar: Türkçe, bol emoji, Markdown işareti (*, _, #) KULLANMA, düz metin.
 
 VERİLER:
@@ -146,25 +149,34 @@ def compact(obj, n):
     return s[:n]
 
 
-def matches_of(date_str):
-    out, offset = [], 0
-    for _ in range(8):
+def matches_of(date_str, max_pages):
+    out, offset, pages = [], 0, 0
+    for _ in range(max_pages):
         data = hl_get(
             "/football/matches",
             {"date": date_str, "limit": 100, "offset": offset, "timezone": "Europe/Istanbul"},
         )
+        pages += 1
         if not data:
             break
         if isinstance(data, dict):
             items = data.get("data") or []
-            total = (data.get("pagination") or {}).get("totalCount", 0)
+            pg = data.get("pagination") or {}
+            total = pg.get("totalCount") or pg.get("total") or 0
         else:
             items, total = data, 0
         out.extend(items)
         offset += 100
-        if not items or offset >= total:
+        if len(items) < 100 or (total and offset >= total):
             break
-    return out
+    return out, pages
+
+
+def spread(lst, n):
+    """Listeden gün boyunca eşit aralıklı n eleman seçer (sadece erken saatler kalmasın)."""
+    if len(lst) <= n:
+        return lst
+    return [lst[int(i * len(lst) / n)] for i in range(n)]
 
 
 def detail_of(mid):
@@ -196,9 +208,12 @@ def build_data():
         diag.append("HIGHLIGHTLY_API_KEY bulunamadı")
         return None
     now, end = window()
-    seen, fetched = set(), []
-    for d in sorted({now.date().isoformat(), end.date().isoformat()}):
-        for m in matches_of(d):
+    seen, fetched, pages = set(), [], 0
+    dates = sorted({now.date().isoformat(), end.date().isoformat()})
+    for i, d in enumerate(dates):
+        items, pg = matches_of(d, 10 if i == 0 else 3)
+        pages += pg
+        for m in items:
             if m.get("id") not in seen:
                 seen.add(m.get("id"))
                 fetched.append(m)
@@ -216,15 +231,18 @@ def build_data():
             wanted.append((k, m))
         else:
             skipped[lg_text(m)] += 1
-    wanted.sort(key=lambda x: (prio(x[1]), x[0]))
+    wanted.sort(key=lambda x: x[0])
 
-    nat = [x for x in wanted if prio(x[1]) == 0][:NAT_CAND]
-    club = [x for x in wanted if prio(x[1]) != 0]
-    cands = nat + club[: max(0, NAT_CAND + CLUB_CAND - len(nat))]
+    nat = spread([x for x in wanted if prio(x[1]) == 0], NAT_CAND)
+    club_all = [x for x in wanted if prio(x[1]) != 0]
+    club = spread(club_all, CLUB_CAND + max(0, NAT_CAND - len(nat)))
+    cands = nat + club
 
-    rated = []
+    rated, sample = [], None
     for k, m in cands:
         det = detail_of(m.get("id"))
+        if sample is None and det:
+            sample = det
         p, pre = probs_of(det) if det else (None, None)
         conf = max(p.values()) if p else 0
         rated.append((conf, k, m, p, pre, prio(m) == 0))
@@ -237,10 +255,12 @@ def build_data():
 
     diag.append(
         f"Pencere: {now.strftime('%d.%m %H:%M')} - {end.strftime('%d.%m %H:%M')} | "
-        f"çekilen {len(fetched)}, uygun {len(wanted)}, incelenen {len(cands)}, "
+        f"çekilen {len(fetched)} ({pages} sayfa), uygun {len(wanted)}, incelenen {len(cands)}, "
         f"tahmin verisi olan {n_pred}, seçilen {len(sel)} "
         f"(milli {len(nat_sel)}, kulüp {len(sel) - len(nat_sel)})"
     )
+    if n_pred == 0 and sample:
+        diag.append("Detay örneği (olasılık bulunamadı): " + compact(sample, 500))
     if leagues:
         diag.append("Penceredeki ligler: " + ", ".join(f"{k} x{v}" for k, v in leagues.most_common(12)))
     if skipped:
@@ -266,9 +286,10 @@ def build_data():
         lines.append("TÜR: " + ("🌍 milli takım maçı" if is_nat else "🏟️ kulüp maçı"))
         lines.append(f"Lig: {lg_text(m)} | Tarih/Saat (TR): {k.strftime('%d.%m %H:%M')}")
         if p:
+            lines.append(f"Ev sahibi (MS1): {nm(h)} | Deplasman (MS2): {nm(a)}")
             lines.append(
-                f"Sağlayıcı olasılıkları % (ev/beraberlik/dep): "
-                f"{p['home']:.0f} / {p['draw']:.0f} / {p['away']:.0f}"
+                f"Sağlayıcı olasılıkları: {nm(h)} kazanır (MS1) %{p['home']:.0f} | "
+                f"beraberlik (MS0) %{p['draw']:.0f} | {nm(a)} kazanır (MS2) %{p['away']:.0f}"
             )
             lines.append(f"Model bilgisi: {compact(pre, 300)}")
         else:
